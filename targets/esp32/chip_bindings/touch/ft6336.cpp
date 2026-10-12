@@ -1,6 +1,7 @@
 #include "ft6336_controller.h"
 #include "board.h"
 #include "i2c.h"
+#include "host/display_orientation.h"
 
 #include "driver/gpio.h"
 #include "esp_attr.h"
@@ -25,7 +26,28 @@ constexpr int kPollIntervalMs = 10;
 // drags don't run this task, so they rastered uncontended at ~86fps). At
 // priority 4 it can't preempt the raster; it samples in the render's idle
 // windows instead, still at the panel's full report rate.
-constexpr int kTaskPriority = 4;
+//
+// That reasoning holds only while the render IS the busiest thing on CPU1. An
+// app that also runs hard real-time audio there leaves a priority-4 task
+// essentially unschedulable, so a finger-down is read seconds late. Such an
+// app's build raises the poll above its render and below its audio deadline
+// tasks; the work per iteration is one I2C transaction, so the higher priority
+// costs microseconds, not bandwidth. Same rule as the FT3168 binding.
+#ifndef GEA_EMBEDDED_TOUCH_TASK_PRIORITY
+#if defined(GEA_EMBEDDED_APP_USES_AUDIO) && GEA_EMBEDDED_APP_USES_AUDIO
+#define GEA_EMBEDDED_TOUCH_TASK_PRIORITY 8
+#else
+#define GEA_EMBEDDED_TOUCH_TASK_PRIORITY 4
+#endif
+#endif
+constexpr int kTaskPriority = GEA_EMBEDDED_TOUCH_TASK_PRIORITY;
+
+// The controller reports in the panel's native frame; the app sees the
+// rotated viewport. Identity in the native orientation, so boards that never
+// rotate are unaffected (the e-paper and P4 touch glue does the same).
+void mapToViewport(int *x, int *y) {
+  gea::framework::display::detail::DisplayOrientationState::mapPanelToViewport(x, y);
+}
 constexpr TickType_t kI2cTimeoutTicks = pdMS_TO_TICKS(100);
 
 }  // namespace
@@ -99,6 +121,7 @@ esp_err_t TouchController::begin() {
 
 bool TouchController::read(TouchSample &sample) {
   const bool touching = core_.read(device_, sample);
+  if (touching) mapToViewport(&sample.x, &sample.y);
   current_ = sample;
   return touching;
 }
@@ -228,6 +251,7 @@ void TouchController::pollLoop() {
 
     gea::chips::ft6336::MultiTouchSample multi;
     core_.readMulti(device_, multi);  // multi.count == 0 when no contact
+    for (int i = 0; i < multi.count; i++) mapToViewport(&multi.x[i], &multi.y[i]);
 
     // DIAG: does the chip ever report a 2nd contact?
     static int s_maxCount = 0;
