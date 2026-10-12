@@ -133,6 +133,10 @@ std::size_t g_internalCacheHeadroom = 0;
 	int g_flushRows = kHeight;
 	int g_flushDepth = 1;
 	gea::platform::display::DisplayFlushPerfStats g_stats = {};
+	// Cumulative, never reset by flushStatsReset (the QSPI and headless layers
+	// keep the same odometer): a poller watches these go quiet between frames.
+	std::atomic<std::uint32_t> g_odometerCalls{0};
+	std::atomic<std::uint64_t> g_odometerPixels{0};
 
 	bool clipRect(int *x0, int *y0, int *x1, int *y1);
 
@@ -160,6 +164,8 @@ void addFlushStats(int64_t totalUs, int pixelCount)
 	g_stats.totalUs += totalUs;
 	g_stats.callCount += 1;
 	g_stats.pixelCount += pixelCount;
+	g_odometerCalls.fetch_add(1, std::memory_order_relaxed);
+	g_odometerPixels.fetch_add(static_cast<std::uint64_t>(pixelCount), std::memory_order_relaxed);
 }
 
 void addFlushStageStats(int64_t copyUs, int64_t cacheUs)
@@ -1357,6 +1363,11 @@ void Display::flushStatsRead(int64_t *totalUs, int *callCount, int *pixelCount)
 
 DisplayFlushPerfStats Display::flushPerfStatsRead() { return g_stats; }
 void Display::flushStatsReset() { g_stats = {}; }
+void Display::flushOdometerRead(uint32_t &calls, uint64_t &pixels)
+{
+	calls = g_odometerCalls.load(std::memory_order_relaxed);
+	pixels = g_odometerPixels.load(std::memory_order_relaxed);
+}
 const char *Display::flushStageName() { return "idle"; }
 int Display::flushStageChunk() { return 0; }
 DisplayFlushStageDetail Display::flushStageDetail() { return {}; }

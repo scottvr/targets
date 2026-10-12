@@ -275,6 +275,7 @@ public:
 		}
 		bool ok = true;
 		flushStats_.callCount++;
+		flushOdometerCalls_.fetch_add(1, std::memory_order_relaxed);
 		for (int i = 0; i < dirtyCount; ++i) {
 			const auto &rect = dirtyRects[i];
 			if (!flushNativeLogicalRect({rect.x0, rect.y0, rect.x1, rect.y1})) {
@@ -296,6 +297,7 @@ public:
 		if (needsFullPhysicalFlush_) {
 			const std::int64_t started = esp_timer_get_time();
 			flushStats_.callCount++;
+			flushOdometerCalls_.fetch_add(1, std::memory_order_relaxed);
 			ESP_LOGI(kTag, "first physical flush covers full logical frame %dx%d", logicalWidth(), logicalHeight());
 			const bool ok = flushNativeLogicalRect({0, 0, logicalWidth() - 1, logicalHeight() - 1});
 			flushStats_.totalUs += esp_timer_get_time() - started;
@@ -308,6 +310,7 @@ public:
 		const std::int64_t started = esp_timer_get_time();
 		bool ok = true;
 		flushStats_.callCount++;
+		flushOdometerCalls_.fetch_add(1, std::memory_order_relaxed);
 		for (int i = 0; i < count; ++i) {
 			const auto &rect = rects[i];
 			if (!flushNativeLogicalRect({rect.x0, rect.y0, rect.x1, rect.y1})) {
@@ -390,6 +393,7 @@ public:
 		const std::int64_t started = esp_timer_get_time();
 		bool ok = true;
 		flushStats_.callCount++;
+		flushOdometerCalls_.fetch_add(1, std::memory_order_relaxed);
 		for (int i = 0; i < regionCount; ++i) {
 			present::Rect region = clampLogicalRect(regions[i], logicalWidth(), logicalHeight());
 			if (!present::valid(region)) continue;
@@ -472,6 +476,7 @@ public:
 
 		const std::int64_t started = esp_timer_get_time();
 		flushStats_.callCount++;
+		flushOdometerCalls_.fetch_add(1, std::memory_order_relaxed);
 		const std::int64_t rasterStartUs = esp_timer_get_time();
 		if (canIncremental && !needsFullPhysicalFlush_) {
 			drawCircleBatchRaw(previousPresentFrame_.commands[1], clear.color, true);
@@ -606,6 +611,14 @@ public:
 
 	platform_display::DisplayFlushPerfStats flushStats() const { return flushStats_; }
 	void flushStatsReset() { flushStats_ = {}; }
+	// Cumulative, never reset by flushStatsReset: a poller sampling between
+	// frames sees the per-frame counters zeroed, so it watches these go quiet
+	// instead (same contract as the QSPI and headless layers).
+	void flushOdometerRead(std::uint32_t &calls, std::uint64_t &pixels) const
+	{
+		calls = flushOdometerCalls_.load(std::memory_order_relaxed);
+		pixels = flushOdometerPixels_.load(std::memory_order_relaxed);
+	}
 
 	const char *flushStageName() const { return "idle"; }
 	int flushStageChunk() const { return 0; }
@@ -1021,6 +1034,7 @@ private:
 		stagingSlot_ = (stagingSlot_ + 1) % stagingDepth_;
 		flushStats_.chunkCount++;
 		flushStats_.pixelCount += pixels;
+		flushOdometerPixels_.fetch_add(static_cast<std::uint64_t>(pixels), std::memory_order_relaxed);
 		xSemaphoreGive(slotReady_);
 	}
 
@@ -1187,6 +1201,8 @@ private:
 	bool backgroundCacheAttempted_ = false;
 	bool backdropCacheAttempted_ = false;
 	platform_display::DisplayFlushPerfStats flushStats_{};
+	std::atomic<std::uint32_t> flushOdometerCalls_{0};
+	std::atomic<std::uint64_t> flushOdometerPixels_{0};
 	present::Frame previousPresentFrame_{};
 	bool previousPresentValid_ = false;
 	bool needsFullPhysicalFlush_ = true;
@@ -1419,6 +1435,7 @@ void Display::flushStatsRead(std::int64_t *total_us, int *call_count, int *pixel
 }
 DisplayFlushPerfStats Display::flushPerfStatsRead() { return gea::platform::esp32_s3_sticks3::display::DisplayBackend::instance().flushStats(); }
 void Display::flushStatsReset() { gea::platform::esp32_s3_sticks3::display::DisplayBackend::instance().flushStatsReset(); }
+void Display::flushOdometerRead(std::uint32_t &calls, std::uint64_t &pixels) { gea::platform::esp32_s3_sticks3::display::DisplayBackend::instance().flushOdometerRead(calls, pixels); }
 const char *Display::flushStageName() { return gea::platform::esp32_s3_sticks3::display::DisplayBackend::instance().flushStageName(); }
 int Display::flushStageChunk() { return gea::platform::esp32_s3_sticks3::display::DisplayBackend::instance().flushStageChunk(); }
 DisplayFlushStageDetail Display::flushStageDetail() { return gea::platform::esp32_s3_sticks3::display::DisplayBackend::instance().flushStageDetail(); }
