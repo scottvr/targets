@@ -59,6 +59,18 @@ constexpr const char *kTag = GEA_ST7789_LOG_TAG;
 #ifndef GEA_ST7789_M5PM1_POWER
 #define GEA_ST7789_M5PM1_POWER 1
 #endif
+// Wiring choices another board makes with this pipeline (the Waveshare 1.54
+// includes this file; a composed board sets these from its target.cmake):
+// colour element order on the wire, and whether the glass runs inverted (the
+// StickS3 does, as do most ST7789 IPS modules; ILI9341-class glass does not).
+// A board with no backlight GPIO (always-on backlight) or no reset GPIO (reset
+// tied to EN) leaves those GPIO_NUM_NC in board.h; see initBacklight().
+#ifndef GEA_ST7789_RGB_ORDER_BGR
+#define GEA_ST7789_RGB_ORDER_BGR 0
+#endif
+#ifndef GEA_ST7789_INVERT_COLORS
+#define GEA_ST7789_INVERT_COLORS 1
+#endif
 constexpr int kNativeWidth = platform_display::kNativeWidth;    // 135
 constexpr int kNativeHeight = platform_display::kNativeHeight;  // 240
 constexpr int kMaxLogicalWidth = kNativeHeight > kNativeWidth ? kNativeHeight : kNativeWidth;
@@ -106,6 +118,9 @@ constexpr int kStagingBytes = kNativeWidth * kFlushRowsDefault * static_cast<int
 constexpr ledc_channel_t kBacklightLedcChannel = LEDC_CHANNEL_1;
 constexpr ledc_timer_t kBacklightLedcTimer = LEDC_TIMER_1;
 constexpr int kBacklightLedcMaxDuty = 1023;
+// A board whose backlight is hard-wired on routes no PWM line; then
+// brightness is a no-op and no LEDC channel is claimed.
+constexpr bool kHasBacklight = gea::platform::board::display.backlight != GPIO_NUM_NC;
 constexpr int kMaxPresentRects = 16;
 constexpr int kOwnedFrameBufferPixels = kMaxPixels;
 
@@ -672,6 +687,10 @@ private:
 	bool initBacklight()
 	{
 		if (brightnessInitialized_) return true;
+		if constexpr (!kHasBacklight) {
+			brightnessInitialized_ = true;
+			return true;
+		}
 
 		ledc_timer_config_t timerConfig{};
 		timerConfig.speed_mode = LEDC_LOW_SPEED_MODE;
@@ -705,6 +724,7 @@ private:
 
 	void updateBacklightDuty()
 	{
+		if constexpr (!kHasBacklight) return;
 		const std::uint32_t duty = static_cast<std::uint32_t>((kBacklightLedcMaxDuty * brightness_) / 100);
 		const esp_err_t setErr = ledc_set_duty(LEDC_LOW_SPEED_MODE, kBacklightLedcChannel, duty);
 		const esp_err_t updateErr = ledc_update_duty(LEDC_LOW_SPEED_MODE, kBacklightLedcChannel);
@@ -910,7 +930,7 @@ private:
 
 		esp_lcd_panel_dev_config_t panelConfig = {};
 		panelConfig.reset_gpio_num = gea::platform::board::display.reset;
-		panelConfig.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+		panelConfig.rgb_ele_order = GEA_ST7789_RGB_ORDER_BGR ? LCD_RGB_ELEMENT_ORDER_BGR : LCD_RGB_ELEMENT_ORDER_RGB;
 		panelConfig.bits_per_pixel = kPanelBitsPerPixel;
 		err = esp_lcd_new_panel_st7789(io_, &panelConfig, &panel_);
 		if (err != ESP_OK) {
@@ -927,8 +947,9 @@ private:
 			ESP_LOGE(kTag, "panel init failed: %s", esp_err_to_name(err));
 			return false;
 		}
-		// The StickS3 glass runs color-inverted (M5GFX: invert = true).
-		esp_lcd_panel_invert_color(panel_, true);
+		// The StickS3 glass runs color-inverted (M5GFX: invert = true); other
+		// glass on this pipeline says so in GEA_ST7789_INVERT_COLORS.
+		esp_lcd_panel_invert_color(panel_, GEA_ST7789_INVERT_COLORS != 0);
 		applyPanelOrientation();
 		err = esp_lcd_panel_disp_on_off(panel_, true);
 		if (err != ESP_OK) {

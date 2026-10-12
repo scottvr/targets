@@ -436,7 +436,9 @@ if(GEA_CUSTOM_TARGET_ACTIVE)
     # A parallel RGB panel is a different layer altogether: the LCD peripheral
     # scans the framebuffer out and the rgb_panel binding IS the Display, so
     # display.cpp (QSPI transport, chunked flush, TE) stays out of that build.
-    if(GEA_CUSTOM_TARGET_HAS_DISPLAY AND NOT GEA_CUSTOM_TARGET_DISPLAY_INTERFACE STREQUAL "rgb")
+    # So is a 4-wire SPI panel: the st7789 binding carries the StickS3
+    # pipeline (its own staging bands, rotate-on-flush, LEDC backlight).
+    if(GEA_CUSTOM_TARGET_HAS_DISPLAY AND NOT GEA_CUSTOM_TARGET_DISPLAY_INTERFACE MATCHES "^(rgb|spi)$")
         list(APPEND GEA_EMBEDDED_BOARD_SOURCES "${GEA_EMBEDDED_ROOT}/targets/esp32/display.cpp")
     endif()
     list(APPEND GEA_EMBEDDED_BOARD_SOURCES ${GEA_CUSTOM_TARGET_DISPLAY_SOURCES})
