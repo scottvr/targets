@@ -54,6 +54,11 @@ the definition against that same catalog, generates `board.h`, rejects GPIO
 collisions, and includes only the selected portable sources and ESP-IDF
 bindings. The first composable platform base is `esp32-s3`; its complete
 display and touch stack is CO5300, FT3168, AXP2101, QMI8658, and ES8311.
+A composed board can instead take an ST7789-class TFT on a plain 4-wire SPI
+bus (`chips.display.interface: "spi"`, RGB or BGR order, optional reset and
+backlight lines; see the CLI's `docs/spi-panels.md`), a bare parallel RGB
+panel, a GT911 or an FT6336 touch controller (polled when no INT line is
+routed), and an I/O expander for its slow control lines.
 Controllers without an ESP32-S3 binding fail before compilation.
 
 Every chip role is optional, so a bare module composes too. Omit `chips.display`

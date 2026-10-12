@@ -56,6 +56,15 @@ Concrete examples in the current tree:
   also answers the `Touchscreen` surface itself, so a composed board links it
   with no board-local glue. Its reset line may be a GPIO or a pin on the
   board's I/O expander; INT is driven low across reset to fix the I2C address.
+- `touch/ft6336.cpp` adapts the same for `gea::chips::ft6336::ControllerCore`
+  and maps contacts into the rotated viewport; `touch/ft6336_touchscreen.cpp`
+  answers the `Touchscreen` surface on top of it, so a composed board links
+  the pair and a built-in target's `touch.cpp` just includes the second file.
+- `displays/st7789.cpp` is a whole `Display` for an ST7789-class panel on a
+  4-wire SPI bus: it includes the M5Stack StickS3 pipeline (shared the same
+  way by the Touch LCD 1.54) and reads the board's `St7789DisplayConfig` plus
+  the `GEA_ST7789_*` definitions the composer emits (clock, mode, colour
+  order, inversion, GRAM gaps). Reset and backlight lines are optional.
 - `displays/rgb_panel.cpp` is a whole `Display` for a bare parallel RGB (DPI)
   panel: the S3's LCD peripheral scans a PSRAM framebuffer out and there is no
   controller to talk to, so it does not sit behind `qspi_panel.h`. Timings and
