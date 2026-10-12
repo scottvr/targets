@@ -16,8 +16,13 @@ if(NOT DEFINED GEA_FIND_SOURCES_FOLLOW_SYMLINKS)
     set(GEA_FIND_SOURCES_FOLLOW_SYMLINKS ON)
 endif()
 set(_GEA_FIND_FILES_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/gea-find-files.mjs")
+# .gea is the CLI's own state directory inside the project: its default build
+# root is .gea/build, which `build` already prunes by name, but a project that
+# sets GEA_PROJECT_BUILD_ROOT to another name under .gea would otherwise have
+# the generated gea-vite-bundle.js found as a source of itself on the next
+# reconfigure, and ninja refuses the cycle.
 set(_GEA_FIND_DEFAULT_PRUNES
-    node_modules dist .vite build .build .scratch .test-tmp generated-output
+    node_modules dist .vite .gea build .build .scratch .test-tmp generated-output
     ${GEA_FIND_SOURCES_EXTRA_PRUNES})
 
 function(_gea_run_find_files OUT_VAR DIR)
