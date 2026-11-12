@@ -28,6 +28,43 @@
 #define GEA_EMBEDDED_DISPLAY_RGB_STRIP_RASTER 1
 #endif
 
+// Bounce buffers vs direct PSRAM scanout: with bounce, a core-0 ISR memcpys
+// every scanline batch from PSRAM into internal SRAM -- a standing CPU tax on
+// the ISR's core. With 0 the GDMA reads the PSRAM framebuffer directly (no CPU
+// in the scanout path); the risk is scanout underrun (visible drift) when CPU
+// PSRAM traffic starves the DMA.
+#ifndef GEA_EMBEDDED_DISPLAY_RGB_BOUNCE
+#define GEA_EMBEDDED_DISPLAY_RGB_BOUNCE 1
+#endif
+
+// Tear-free present: two driver-owned scanout framebuffers plus the persistent
+// draw buffer. A frame is published into whichever scanout buffer the panel is
+// NOT reading, then handed to the driver, which switches to it at the next frame
+// boundary. With a single scanout buffer the publish copy wrote rows the panel
+// was scanning at that moment, so every animated frame tore (and a ~17ms copy at
+// 44Hz refresh spans most of a scan). 0 restores the single-buffer path.
+// Core for the panel's interrupts (the bounce-buffer copy ISR); -1 = the core
+// that initialises the display.
+// Core 1: the renderer runs on core 0, and the bounce copy costs it ~10% there.
+// With three scanout buffers, svg-charts on the CrowPanel 7 measured 26.6 fps
+// with the ISR on core 1 against 25.0 on core 0. (With two buffers, core 1 was
+// worse: a swap from the other core waits two frame ends, so frames snapped to
+// panel-rate / 3.)
+#ifndef GEA_EMBEDDED_DISPLAY_RGB_ISR_CORE
+#define GEA_EMBEDDED_DISPLAY_RGB_ISR_CORE 1
+#endif
+
+#ifndef GEA_EMBEDDED_DISPLAY_RGB_SWAP_FBS
+#define GEA_EMBEDDED_DISPLAY_RGB_SWAP_FBS 1
+#endif
+// Scanout buffers in swap mode (2 or 3). With three, the renderer draws into a
+// buffer the panel released one frame earlier, so a publish never waits for the
+// second vsync after the previous one: the frame rate follows the frame work
+// instead of snapping to panel-rate / 2.
+#ifndef GEA_EMBEDDED_DISPLAY_RGB_SCAN_FBS
+#define GEA_EMBEDDED_DISPLAY_RGB_SCAN_FBS 3
+#endif
+
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_cache.h"
@@ -39,6 +76,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "soc/clk_tree_defs.h"
 
@@ -112,7 +150,26 @@ bool onWorkerCore()
 	return g_renderCoreId >= 0 && static_cast<int>(xPortGetCoreID()) != g_renderCoreId;
 }
 
+using gea::platform::display::DisplayFlushRect;
+bool g_swapFbs = false;
+bool g_backReady = true;
+void ensureBackReady(const DisplayFlushRect *skip = nullptr, int skipCount = 0);
+
+// Every Display draw entry point and Display::canvas() come through here, so this
+// is where the back buffer is made safe to draw into after a swap (a flag test
+// on the fast path). The worker core's band replay is covered by the main core
+// readying the buffer before it submits the band.
 gea::framework::graphics::Canvas &replayCanvas()
+{
+	if (onWorkerCore()) return g_workerCanvas;
+	if (!g_backReady) ensureBackReady();
+	return g_canvas;
+}
+// The same canvas without readying the back buffer, for state that touches no
+// pixels (clip, alpha, rebinding). Readying early would patch the whole stale
+// area before the fused flush can say which rects it repaints, and would block
+// on the panel releasing the buffer right after every swap.
+gea::framework::graphics::Canvas &stateCanvas()
 {
 	return onWorkerCore() ? g_workerCanvas : g_canvas;
 }
@@ -144,16 +201,28 @@ std::size_t g_internalCacheHeadroom = 0;
 		                ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
 	}
 
-	void cacheWritebackRect(int x0, int y0, int x1, int y1)
+	// Write a scanout region back from the data cache so the LCD's GDMA sees it.
+	// Only direct-PSRAM scanout needs this: in bounce-buffer mode the driver's ISR
+	// memcpys the framebuffer through the same (shared, single) S3 data cache, so
+	// dirty lines are already coherent for it -- IDF's own draw_bitmap skips the
+	// sync in that mode for the same reason. Skipping it saves a cache walk over
+	// every published row.
+	void cacheWritebackRect(std::uint16_t *buffer, int x0, int y0, int x1, int y1)
 	{
-		if (!g_framebuffer || !clipRect(&x0, &y0, &x1, &y1)) return;
+#if GEA_EMBEDDED_DISPLAY_RGB_BOUNCE
+		(void)buffer; (void)x0; (void)y0; (void)x1; (void)y1;
+#else
+		if (!buffer || !clipRect(&x0, &y0, &x1, &y1)) return;
 		const std::size_t begin = static_cast<std::size_t>(y0) * kWidth + static_cast<std::size_t>(x0);
 		const std::size_t end = static_cast<std::size_t>(y1) * kWidth + static_cast<std::size_t>(x1) + 1;
 		if (end <= begin || end > kPixelCount) return;
-		esp_cache_msync(&g_framebuffer[begin],
+		esp_cache_msync(&buffer[begin],
 		                (end - begin) * sizeof(std::uint16_t),
 		                ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+#endif
 	}
+
+	void cacheWritebackRect(int x0, int y0, int x1, int y1) { cacheWritebackRect(g_framebuffer, x0, y0, x1, y1); }
 
 void addFlushStats(int64_t totalUs, int pixelCount)
 {
@@ -166,6 +235,329 @@ void addFlushStageStats(int64_t copyUs, int64_t cacheUs)
 {
 	g_stats.copyUs += copyUs;
 	g_stats.completeWaitUs += cacheUs;
+}
+
+// ── Swapped scanout buffers (direct mode) ────────────────────────────────────
+// Two driver-owned scanout buffers and no separate draw buffer: the renderer
+// draws straight into the back buffer (g_drawFramebuffer points at it), and a
+// publish hands that buffer to the panel, which switches at the next frame wrap.
+// g_scanFb[g_frontIndex] is the buffer most recently handed over (g_framebuffer;
+// screenshots read it).
+//
+// After a swap the new back buffer lags by whatever the frame just published
+// changed (its stale list). Before anything draws into it, ensureBackReady()
+// waits for the panel to release it and patches those regions in from the front
+// -- the previous frame's dirty rects only, never the whole frame. The fused
+// raster path (flushRectsRasterized) knows which rects it is about to repaint
+// completely, so it patches only the stale area OUTSIDE them: when an animation
+// redraws the same region every frame, almost nothing is copied and each dirty
+// pixel reaches PSRAM exactly once, from an internal-RAM strip.
+struct StaleRect {
+	int x0, y0, x1, y1;
+};
+constexpr int kMaxStaleRects = 8;
+struct StaleList {
+	StaleRect rects[kMaxStaleRects];
+	int count = 0;
+};
+
+constexpr int kMaxScanFbs = 3;
+std::uint16_t *g_scanFb[kMaxScanFbs] = {nullptr, nullptr, nullptr};
+int g_scanFbCount = 1;
+int g_frontIndex = 0;
+// The buffer the renderer draws into: the one after the front in rotation.
+int g_drawIndex = 1;
+StaleList g_stale[kMaxScanFbs];
+// New pixels reached the back buffer since the last swap.
+bool g_publishPending = false;
+// g_backReady (declared above replayCanvas): the back buffer is released by the
+// panel and patched up to date, so drawing into it is safe. Cleared by every swap.
+// Serializes readying, in case a draw on another task races the frame task.
+SemaphoreHandle_t g_readyMutex = nullptr;
+// Counted by the driver's frame-complete callback, which runs right after the
+// bounce ISR has latched the driver's current buffer for the next frame.
+volatile std::uint32_t g_frameSeq = 0;
+// DIAG: panel VSYNCs. In steady state there is exactly one frame-buffer wrap per
+// VSYNC; a difference means the bounce ISR fell behind and the driver had to
+// restart the scan (the visible "shift").
+volatile std::uint32_t g_vsyncSeq = 0;
+std::uint32_t g_diagVsync0 = 0, g_diagFrame0 = 0;
+// Buffer i is released by the panel once g_frameSeq reaches g_freeSeq[i].
+std::uint32_t g_freeSeq[kMaxScanFbs] = {0, 0, 0};
+int g_panelIsrCore = -1;
+// A private semaphore, not a task notification: the frame task's notification
+// slot belongs to whoever else wakes it, and there is only one slot.
+SemaphoreHandle_t g_frameSem = nullptr;
+volatile bool g_swapWaiting = false;
+portMUX_TYPE g_swapMux = portMUX_INITIALIZER_UNLOCKED;
+// DIAG: publish cost decomposition, printed every kSwapDiagFrames swaps.
+constexpr int kSwapDiagFrames = 100;
+struct SwapDiag {
+	std::int64_t copyUs = 0, waitUs = 0, totalUs = 0, rasterUs = 0;
+	std::int64_t px = 0, patchPx = 0;
+	int frames = 0, waits = 0, timeouts = 0, unready = 0, late = 0;
+	int paths[4] = {0, 0, 0, 0};  // flush, flushRects, rasterized, strip
+	std::int64_t windowStartUs = 0;
+} g_swapDiag;
+std::int64_t g_lastBlockUs = 0;
+
+IRAM_ATTR bool onPanelVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *)
+{
+	g_vsyncSeq = g_vsyncSeq + 1;
+	return false;
+}
+
+IRAM_ATTR bool onPanelFrameComplete(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *)
+{
+	g_frameSeq = g_frameSeq + 1;
+	if (!g_swapWaiting) return false;
+	BaseType_t woken = pdFALSE;
+	xSemaphoreGiveFromISR(g_frameSem, &woken);
+	return woken == pdTRUE;
+}
+
+int rectArea(int x0, int y0, int x1, int y1) { return (x1 - x0 + 1) * (y1 - y0 + 1); }
+
+void staleAdd(StaleList &list, int x0, int y0, int x1, int y1)
+{
+	for (int i = 0; i < list.count; ++i) {
+		StaleRect &r = list.rects[i];
+		if (x0 >= r.x0 && y0 >= r.y0 && x1 <= r.x1 && y1 <= r.y1) return;  // already covered
+		// Merge when the bounding box costs no more than copying both: an
+		// animation's dirty box drifts a little frame to frame, and copying the two
+		// overlapping boxes separately would move the overlap twice.
+		const int ux0 = std::min(x0, r.x0), uy0 = std::min(y0, r.y0);
+		const int ux1 = std::max(x1, r.x1), uy1 = std::max(y1, r.y1);
+		if (rectArea(ux0, uy0, ux1, uy1) <= rectArea(x0, y0, x1, y1) + rectArea(r.x0, r.y0, r.x1, r.y1)) {
+			list.rects[i] = list.rects[--list.count];
+			staleAdd(list, ux0, uy0, ux1, uy1);  // the grown box may now swallow others
+			return;
+		}
+	}
+	if (list.count < kMaxStaleRects) {
+		list.rects[list.count++] = {x0, y0, x1, y1};
+		return;
+	}
+	// Full: fold everything into one bounding box (correct, just copies more).
+	StaleRect box = {x0, y0, x1, y1};
+	for (int i = 0; i < list.count; ++i) {
+		const StaleRect &r = list.rects[i];
+		box = {std::min(box.x0, r.x0), std::min(box.y0, r.y0), std::max(box.x1, r.x1), std::max(box.y1, r.y1)};
+	}
+	list.rects[0] = box;
+	list.count = 1;
+}
+
+// A region the back buffer now holds new pixels for: the front lags there.
+void markStale(int x0, int y0, int x1, int y1)
+{
+	for (int i = 0; i < g_scanFbCount; ++i)
+		if (i != g_drawIndex) staleAdd(g_stale[i], x0, y0, x1, y1);
+	g_publishPending = true;
+}
+
+// Block (not spin) until the panel has stopped reading the back buffer. Normally
+// the swap latched long ago and this returns at once; it only waits when frames
+// are published faster than the panel refreshes.
+void waitBackBufferFree()
+{
+	const std::uint32_t freeSeq = g_freeSeq[g_drawIndex];
+	if (static_cast<std::int32_t>(g_frameSeq - freeSeq) >= 0) return;
+	const std::int64_t w0 = esp_timer_get_time();
+	xSemaphoreTake(g_frameSem, 0);  // drop a stale give from an earlier wait
+	g_swapWaiting = true;
+	while (static_cast<std::int32_t>(g_frameSeq - freeSeq) < 0) {
+		xSemaphoreTake(g_frameSem, pdMS_TO_TICKS(5));
+		if (esp_timer_get_time() - w0 > 100000) {
+			// The panel stopped scanning (or never started): don't hang the frame.
+			g_swapDiag.timeouts++;
+			break;
+		}
+	}
+	g_swapWaiting = false;
+	const std::int64_t now = esp_timer_get_time();
+	g_swapDiag.waitUs += now - w0;
+	g_swapDiag.waits++;
+	g_lastBlockUs = now;
+}
+
+// Hand the back buffer to the panel. The driver switches to it when the bounce
+// ISR wraps to the next frame; g_freeSeq says when the OLD front is released.
+// If this task runs on the ISR's core, masking interrupts around the switch
+// guarantees the next frame-complete already scans the new buffer; from the other
+// core the ISR may be mid-wrap with the old index, so one more frame is required.
+void commitSwap(int back)
+{
+	std::uint32_t seq;
+	// Direct scanout: draw_bitmap writes the whole frame back from the cache
+	// (too long for a critical section), and the GDMA may prefetch one more pass
+	// of the old buffer, so always allow two frame ends.
+	if (GEA_EMBEDDED_DISPLAY_RGB_BOUNCE && static_cast<int>(xPortGetCoreID()) == g_panelIsrCore) {
+		taskENTER_CRITICAL(&g_swapMux);
+		esp_lcd_panel_draw_bitmap(g_panel, 0, 0, kWidth, kHeight, g_scanFb[back]);
+		seq = g_frameSeq + 1;
+		taskEXIT_CRITICAL(&g_swapMux);
+	} else {
+		esp_lcd_panel_draw_bitmap(g_panel, 0, 0, kWidth, kHeight, g_scanFb[back]);
+		seq = g_frameSeq + 2;
+	}
+	g_freeSeq[g_frontIndex] = seq;
+	std::uint16_t *oldBack = g_scanFb[back];
+	g_frontIndex = back;
+	g_drawIndex = (back + 1) % g_scanFbCount;
+	g_framebuffer = g_scanFb[back];
+	g_drawFramebuffer = g_scanFb[g_drawIndex];
+	g_backReady = false;
+	// Follow the swap with the draw canvases -- unless the render layer has one
+	// bound to a scratch buffer right now (it rebinds via rebindCanvasToFramebuffer).
+	if (g_canvas.pixels() == oldBack) g_canvas.bindPixels(g_drawFramebuffer, kWidth, kHeight);
+	if (g_workerCanvas.pixels() == oldBack) g_workerCanvas.bindPixels(g_drawFramebuffer, kWidth, kHeight);
+}
+
+// One line per kSwapDiagFrames published frames, the same in both modes:
+// publish = whole Display flush call, raster = fused raster inside it, copy =
+// pixel copies into scanout memory, wait = blocked on the panel releasing the back buffer.
+void noteFrameDiag(int path, std::int64_t totalUs, int px)
+{
+	if (px <= 0) return;
+	g_swapDiag.paths[path]++;
+	g_swapDiag.totalUs += totalUs;
+	g_swapDiag.px += px;
+	if (g_swapDiag.windowStartUs == 0) g_swapDiag.windowStartUs = esp_timer_get_time();
+	if (++g_swapDiag.frames >= kSwapDiagFrames) {
+		const std::int64_t now = esp_timer_get_time();
+		const int n = g_swapDiag.frames;
+		const std::uint32_t vs = g_vsyncSeq, fr = g_frameSeq;
+		const double secs = static_cast<double>(now - g_swapDiag.windowStartUs) / 1e6;
+		std::printf("[rgb-swap] panel vsync/s=%.2f wraps/s=%.2f slip=%d | swap=%d frames=%d paths=%d/%d/%d/%d publish=%dus raster=%dus copy=%dus wait=%dus(%d waits, %d timeouts) px=%d patch_px=%d unready=%d late=%d frames/s=%.1f\n",
+		            (vs - g_diagVsync0) / secs, (fr - g_diagFrame0) / secs,
+		            static_cast<int>((vs - g_diagVsync0) - (fr - g_diagFrame0)),
+		            g_swapFbs ? 1 : 0,
+		            n,
+		            g_swapDiag.paths[0], g_swapDiag.paths[1], g_swapDiag.paths[2], g_swapDiag.paths[3],
+		            static_cast<int>(g_swapDiag.totalUs / n),
+		            static_cast<int>(g_swapDiag.rasterUs / n),
+		            static_cast<int>(g_swapDiag.copyUs / n),
+		            static_cast<int>(g_swapDiag.waitUs / n),
+		            g_swapDiag.waits,
+		            g_swapDiag.timeouts,
+		            static_cast<int>(g_swapDiag.px / n),
+		            static_cast<int>(g_swapDiag.patchPx / n),
+		            g_swapDiag.unready,
+		            g_swapDiag.late,
+		            n * 1000000.0 / static_cast<double>(now - g_swapDiag.windowStartUs));
+		g_swapDiag = {};
+		g_swapDiag.windowStartUs = now;
+		g_diagVsync0 = vs;
+		g_diagFrame0 = fr;
+	}
+}
+
+// Copy rect r of the front buffer into the back buffer.
+void patchRect(const StaleRect &r)
+{
+	const std::uint16_t *src = g_scanFb[g_frontIndex];
+	std::uint16_t *dst = g_scanFb[g_drawIndex];
+	const std::size_t bytes = static_cast<std::size_t>(r.x1 - r.x0 + 1) * sizeof(std::uint16_t);
+	for (int y = r.y0; y <= r.y1; ++y) {
+		const std::size_t offset = static_cast<std::size_t>(y) * kWidth + static_cast<std::size_t>(r.x0);
+		std::memcpy(&dst[offset], &src[offset], bytes);
+	}
+	cacheWritebackRect(dst, r.x0, r.y0, r.x1, r.y1);
+}
+
+// a minus b, appended to out (up to 4 pieces). Returns false if out is full.
+bool subtractRect(const StaleRect &a, const StaleRect &b, StaleRect *out, int &n, int cap)
+{
+	if (b.x1 < a.x0 || b.x0 > a.x1 || b.y1 < a.y0 || b.y0 > a.y1) {
+		if (n >= cap) return false;
+		out[n++] = a;
+		return true;
+	}
+	StaleRect pieces[4];
+	int k = 0;
+	if (b.y0 > a.y0) pieces[k++] = {a.x0, a.y0, a.x1, b.y0 - 1};
+	if (b.y1 < a.y1) pieces[k++] = {a.x0, b.y1 + 1, a.x1, a.y1};
+	const int my0 = std::max(a.y0, b.y0), my1 = std::min(a.y1, b.y1);
+	if (b.x0 > a.x0) pieces[k++] = {a.x0, my0, b.x0 - 1, my1};
+	if (b.x1 < a.x1) pieces[k++] = {b.x1 + 1, my0, a.x1, my1};
+	if (n + k > cap) return false;
+	for (int i = 0; i < k; ++i) out[n++] = pieces[i];
+	return true;
+}
+
+// Bring the back buffer up to date from the front, except inside `skip` (rects
+// the caller is about to repaint completely). Skipping is only an optimisation:
+// the patch always runs before the repaint, so copying extra is still correct.
+int patchBack(const DisplayFlushRect *skip, int skipCount)
+{
+	StaleList &list = g_stale[g_drawIndex];
+	constexpr int kCap = 64;
+	StaleRect work[2][kCap];
+	int n = 0;
+	for (int i = 0; i < list.count; ++i) work[0][n++] = list.rects[i];
+	int cur = 0;
+	for (int s = 0; s < skipCount && n > 0; ++s) {
+		const StaleRect b = {skip[s].x0, skip[s].y0, skip[s].x1, skip[s].y1};
+		int m = 0;
+		bool ok = true;
+		for (int i = 0; i < n && ok; ++i) ok = subtractRect(work[cur][i], b, work[cur ^ 1], m, kCap);
+		if (!ok) break;  // too fragmented: copy what we have, still correct
+		cur ^= 1;
+		n = m;
+	}
+	int px = 0;
+	for (int i = 0; i < n; ++i) {
+		patchRect(work[cur][i]);
+		px += rectArea(work[cur][i].x0, work[cur][i].y0, work[cur][i].x1, work[cur][i].y1);
+	}
+	list.count = 0;
+	return px;
+}
+
+// Make the back buffer safe to draw into: released by the panel and current.
+void ensureBackReady(const DisplayFlushRect *skip, int skipCount)
+{
+	if (!g_swapFbs || g_backReady) return;
+	xSemaphoreTake(g_readyMutex, portMAX_DELAY);
+	if (!g_backReady) {
+		// Pixels already drawn since the swap went in ahead of the gate: into a
+		// buffer the panel may still have been scanning, and the patch below may
+		// now overwrite them.
+		int dx0, dy0, dx1, dy1;
+		if (g_canvas.dirty(&dx0, &dy0, &dx1, &dy1) || g_workerCanvas.dirty(&dx0, &dy0, &dx1, &dy1)) g_swapDiag.late++;
+		waitBackBufferFree();
+		const std::int64_t c0 = esp_timer_get_time();
+		g_swapDiag.patchPx += patchBack(skip, skipCount);
+		g_swapDiag.copyUs += esp_timer_get_time() - c0;
+		g_backReady = true;
+	}
+	xSemaphoreGive(g_readyMutex);
+}
+
+// Swap in everything drawn since the last swap. No pixels move here.
+int publishSwap()
+{
+	if (!g_publishPending) return 0;
+	g_publishPending = false;
+	// Something drew into the back buffer without going through replayCanvas /
+	// ensureBackReady: it may have written rows the panel was still scanning.
+	if (!g_backReady) g_swapDiag.unready++;
+	commitSwap(g_drawIndex);
+	return 1;
+}
+
+// The frame task never blocks on an RGB panel (no transfer to wait for), so on a
+// long animation IDLE never runs on its core and the task watchdog fires every
+// 5s -- and its ISR prints a backtrace over the 115200-baud console with that
+// core's interrupts held off long enough to starve the bounce-buffer ISR, a
+// visible glitch. Give IDLE one tick if nothing has blocked for a while.
+void yieldToIdleIfStarved()
+{
+	const std::int64_t now = esp_timer_get_time();
+	if (now - g_lastBlockUs < 500000) return;
+	g_lastBlockUs = now;
+	vTaskDelay(1);
 }
 
 #if GEA_BOARD_HAS_EXPANDER
@@ -195,12 +587,14 @@ esp_err_t updateBacklightDuty()
 	return ESP_OK;
 }
 
-// An expander line is on/off only: any non-zero brightness lights the panel.
+// An expander line is on/off (any non-zero brightness lights the panel) unless
+// the expander carries a level on it, as a board-control MCU does.
 esp_err_t applyBacklight()
 {
 #if GEA_BOARD_HAS_EXPANDER
 	if constexpr (kExpanderBacklightPin >= 0) {
 		auto &expander = gea::platform::esp32::chip_bindings::expanders::ioExpander();
+		if (expander.setLevel(kExpanderBacklightPin, g_brightness)) return ESP_OK;
 		return expander.writePin(kExpanderBacklightPin, g_brightness > 0) ? ESP_OK : ESP_FAIL;
 	}
 #endif
@@ -307,6 +701,25 @@ esp_err_t initRgbController()
   return ESP_OK;
 }
 
+struct PanelCreate {
+	esp_lcd_rgb_panel_config_t *config;
+	esp_err_t err;
+	int core;  // where the driver installed its interrupts (the calling core)
+	SemaphoreHandle_t done;
+};
+
+void createPanel(PanelCreate &c)
+{
+	c.core = static_cast<int>(xPortGetCoreID());
+	c.err = esp_lcd_new_rgb_panel(c.config, &g_panel);
+	while (c.err != ESP_OK && c.config->num_fbs > 1) {
+		ESP_LOGW(kTag, "no room for %d scanout buffers (%s); trying %d", int(c.config->num_fbs),
+		         esp_err_to_name(c.err), int(c.config->num_fbs) - 1);
+		c.config->num_fbs -= 1;
+		c.err = esp_lcd_new_rgb_panel(c.config, &g_panel);
+	}
+}
+
 esp_err_t initRgbPanel()
 {
 	const auto &display = gea::platform::board::display;
@@ -325,15 +738,7 @@ esp_err_t initRgbPanel()
 	config.data_width = 16;
 	config.in_color_format = LCD_COLOR_FMT_RGB565;
 	config.out_color_format = LCD_COLOR_FMT_RGB565;
-	config.num_fbs = 1;
-	// Bounce buffers vs direct PSRAM scanout: with bounce, a core-0 ISR memcpys
-	// every scanline batch from PSRAM into internal SRAM (~27.6MB/s at 12MHz pclk)
-	// — a standing ~30% CPU tax on the render core. With 0 the GDMA reads the
-	// PSRAM framebuffer directly (no CPU in the scanout path); risk is scanout
-	// underrun (visible drift) when CPU PSRAM traffic starves the DMA.
-#ifndef GEA_EMBEDDED_DISPLAY_RGB_BOUNCE
-#define GEA_EMBEDDED_DISPLAY_RGB_BOUNCE 1
-#endif
+	config.num_fbs = GEA_EMBEDDED_DISPLAY_RGB_SWAP_FBS ? GEA_EMBEDDED_DISPLAY_RGB_SCAN_FBS : 1;
 #if GEA_EMBEDDED_DISPLAY_RGB_BOUNCE
 	config.bounce_buffer_size_px = kRgbBounceBufferPixels;
 #else
@@ -348,24 +753,72 @@ esp_err_t initRgbPanel()
 	for (int i = 0; i < 16; ++i) config.data_gpio_nums[i] = display.data[i];
 	config.flags.fb_in_psram = 1;
 
-	esp_err_t err = esp_lcd_new_rgb_panel(&config, &g_panel);
+	// The driver allocates its GDMA EOF and LCD interrupts on the calling core;
+	// commitSwap() needs to know which one that is.
+	PanelCreate create = {&config, ESP_FAIL, -1, nullptr};
+#if GEA_EMBEDDED_DISPLAY_RGB_ISR_CORE >= 0
+	// Install the panel's interrupts (the bounce-buffer copy ISR) on a chosen
+	// core, off the runtime's, by creating the panel from a task pinned there.
+	create.done = xSemaphoreCreateBinary();
+	if (create.done &&
+	    xTaskCreatePinnedToCore([](void *arg) {
+		    auto *c = static_cast<PanelCreate *>(arg);
+		    createPanel(*c);
+		    xSemaphoreGive(c->done);
+		    vTaskDelete(nullptr);
+	    }, "rgb_init", 4096, &create, configMAX_PRIORITIES - 2, nullptr, GEA_EMBEDDED_DISPLAY_RGB_ISR_CORE) == pdPASS) {
+		xSemaphoreTake(create.done, portMAX_DELAY);
+	} else {
+		createPanel(create);
+	}
+	if (create.done) vSemaphoreDelete(create.done);
+#else
+	createPanel(create);
+#endif
+	g_panelIsrCore = create.core;
+	esp_err_t err = create.err;
+	ESP_LOGI(kTag, "panel interrupts on core %d", g_panelIsrCore);
 	if (err != ESP_OK) {
 		ESP_LOGE(kTag, "failed to create RGB panel: %s", esp_err_to_name(err));
 		return err;
+	}
+	g_swapFbs = config.num_fbs > 1;
+	if (g_swapFbs) {
+		g_frameSem = xSemaphoreCreateBinary();
+		g_readyMutex = xSemaphoreCreateMutex();
+		if (!g_frameSem || !g_readyMutex) return ESP_ERR_NO_MEM;
+		esp_lcd_rgb_panel_event_callbacks_t callbacks = {};
+		callbacks.on_frame_buf_complete = onPanelFrameComplete;
+		callbacks.on_vsync = onPanelVsync;
+		err = esp_lcd_rgb_panel_register_event_callbacks(g_panel, &callbacks, nullptr);
+		if (err != ESP_OK) {
+			ESP_LOGE(kTag, "failed to register RGB frame callback: %s", esp_err_to_name(err));
+			return err;
+		}
 	}
 	err = esp_lcd_panel_reset(g_panel);
 	if (err != ESP_OK) return err;
 	err = esp_lcd_panel_init(g_panel);
 	if (err != ESP_OK) return err;
 
-	void *fb = nullptr;
-	err = esp_lcd_rgb_panel_get_frame_buffer(g_panel, 1, &fb);
+	void *fb0 = nullptr;
+	void *fb1 = nullptr;
+	void *fb2 = nullptr;
+	g_scanFbCount = static_cast<int>(config.num_fbs);
+	err = g_scanFbCount >= 3 ? esp_lcd_rgb_panel_get_frame_buffer(g_panel, 3, &fb0, &fb1, &fb2)
+	    : g_scanFbCount == 2 ? esp_lcd_rgb_panel_get_frame_buffer(g_panel, 2, &fb0, &fb1)
+	                         : esp_lcd_rgb_panel_get_frame_buffer(g_panel, 1, &fb0);
 	if (err != ESP_OK) {
 		ESP_LOGE(kTag, "failed to get RGB framebuffer: %s", esp_err_to_name(err));
 		return err;
 	}
-	g_framebuffer = static_cast<std::uint16_t *>(fb);
-	if (!g_framebuffer) return ESP_ERR_NO_MEM;
+	g_scanFb[0] = static_cast<std::uint16_t *>(fb0);
+	g_scanFb[1] = static_cast<std::uint16_t *>(fb1);
+	g_scanFb[2] = static_cast<std::uint16_t *>(fb2);
+	g_frontIndex = 0;
+	g_drawIndex = g_scanFbCount > 1 ? 1 : 0;
+	g_framebuffer = g_scanFb[0];
+	if (!g_framebuffer || (g_swapFbs && !g_scanFb[1])) return ESP_ERR_NO_MEM;
 
 	// Double buffer: the panel framebuffer (g_framebuffer) is continuously scanned out,
 	// so drawing directly into it exposes every intermediate step (e.g. a tick's
@@ -373,16 +826,23 @@ esp_err_t initRgbPanel()
 	// PSRAM back buffer instead; publishDrawRect() copies the fully-composited dirty
 	// region into the scanout framebuffer in one shot, so the panel only ever sees
 	// finished pixels. Falls back to single-buffered direct draw if PSRAM is exhausted.
-	g_drawFramebuffer = static_cast<std::uint16_t *>(
-	    heap_caps_malloc(kFramebufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+	// With swapped scanout buffers the renderer draws straight into the back one.
+	g_drawFramebuffer = g_swapFbs ? g_scanFb[1]
+	                              : static_cast<std::uint16_t *>(heap_caps_aligned_alloc(
+	                                    64, kFramebufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 	if (!g_drawFramebuffer) {
 		ESP_LOGW(kTag, "no PSRAM for back buffer; falling back to single-buffered draw");
 		g_drawFramebuffer = g_framebuffer;
+		g_swapFbs = false;  // drawing straight into the front buffer: nothing to swap
 	}
 
 	std::memset(g_framebuffer, 0, kFramebufferBytes);
 	if (g_drawFramebuffer != g_framebuffer) std::memset(g_drawFramebuffer, 0, kFramebufferBytes);
-		cacheWritebackAll();
+	cacheWritebackAll();
+	for (int i = 1; i < g_scanFbCount; ++i) {
+		std::memset(g_scanFb[i], 0, kFramebufferBytes);
+		cacheWritebackRect(g_scanFb[i], 0, 0, kWidth - 1, kHeight - 1);
+	}
 	g_canvas.bindPixels(g_drawFramebuffer, kWidth, kHeight);
 	g_workerCanvas.bindPixels(g_drawFramebuffer, kWidth, kHeight);
 
@@ -395,12 +855,15 @@ esp_err_t initRgbPanel()
 	ESP_LOGI(kTag, "strip-raster %s strip_buf=%p rows=%d",
 	         g_stripBuffer ? "ON" : "OFF (no internal SRAM)", g_stripBuffer, kStripRows);
 #endif
-	ESP_LOGI(kTag, "RGB panel ready %dx%d pclk=%d bounce_rows=%d fb=%p draw_fb=%p single_fb=%d row_bytes=%u fb_alignment64=%u vsync_restart=%d",
+	ESP_LOGI(kTag, "RGB panel ready %dx%d pclk=%d bounce_rows=%d fb=%p fb2=%p swap=%d isr_core=%d draw_fb=%p single_fb=%d row_bytes=%u fb_alignment64=%u vsync_restart=%d",
 	         kWidth,
 	         kHeight,
 	         kPixelClockHz,
 	         int(config.bounce_buffer_size_px / kWidth),
 	         g_framebuffer,
+	         g_scanFb[1],
+	         g_swapFbs ? 1 : 0,
+	         g_panelIsrCore,
 	         g_drawFramebuffer,
 	         g_framebuffer == g_drawFramebuffer ? 1 : 0,
 	         static_cast<unsigned>(kWidth * sizeof(std::uint16_t)),
@@ -555,10 +1018,17 @@ bool clipRect(int *x0, int *y0, int *x1, int *y1)
 		if (outY1) *outY1 = y1;
 		const int width = x1 - x0 + 1;
 		if (g_framebuffer == g_drawFramebuffer) return width * (y1 - y0 + 1);
+		if (g_swapFbs) {
+			// Deferred: recorded against both scanout buffers, copied by publishSwap().
+			markStale(x0, y0, x1, y1);
+			return width * (y1 - y0 + 1);
+		}
+		const std::int64_t c0 = esp_timer_get_time();
 		for (int y = y0; y <= y1; ++y) {
 		const std::size_t offset = static_cast<std::size_t>(y) * kWidth + static_cast<std::size_t>(x0);
 		std::memcpy(&g_framebuffer[offset], &g_drawFramebuffer[offset], static_cast<std::size_t>(width) * sizeof(std::uint16_t));
 	}
+	g_swapDiag.copyUs += esp_timer_get_time() - c0;
 	return width * (y1 - y0 + 1);
 }
 
@@ -616,14 +1086,18 @@ void renderRowWorkerTask(void *)
 #if GEA_EMBEDDED_DISPLAY_RGB_STRIP_RASTER
 // Runs on the worker core: copy a finished SRAM strip (ctx) to PSRAM scanout rows
 // [y0,y1] and write it back so the panel's scanout DMA sees it.
+// Where presentStripFused publishes: the live buffer on a single-buffer panel,
+// the off-screen back buffer when scanout buffers swap.
+std::uint16_t *g_stripTarget = nullptr;
+
 void copyStripToScanoutThunk(void *ctx, int y0, int y1)
 {
 	const std::uint16_t *src = static_cast<const std::uint16_t *>(ctx);
 	const int rows = y1 - y0 + 1;
-	std::memcpy(&g_framebuffer[static_cast<std::size_t>(y0) * kWidth],
+	std::memcpy(&g_stripTarget[static_cast<std::size_t>(y0) * kWidth],
 	            src,
 	            static_cast<std::size_t>(rows) * kWidth * sizeof(std::uint16_t));
-	cacheWritebackRect(0, y0, kWidth - 1, y1);
+	cacheWritebackRect(g_stripTarget, 0, y0, kWidth - 1, y1);
 }
 
 // Compose the whole frame strip-by-strip in internal SRAM, copying each finished
@@ -642,6 +1116,20 @@ bool presentStripFused(const present::Frame &frame)
 	int stripRows = g_flushRows > 0 ? g_flushRows : kStripRows;
 	if (stripRows > kStripRows) stripRows = kStripRows;
 	const std::int64_t start = esp_timer_get_time();
+	int back = 0;
+	if (g_swapFbs) {
+		// The whole frame lands in the back buffer, so its pending regions are moot:
+		// wait for the panel to release it, but patch nothing.
+		back = g_drawIndex;
+		if (!g_backReady) {
+			waitBackBufferFree();
+			g_stale[back].count = 0;
+			g_backReady = true;
+		}
+		g_stripTarget = g_scanFb[back];
+	} else {
+		g_stripTarget = g_framebuffer;
+	}
 	bool inFlight = false;
 	int idx = 0;
 	for (int row = 0; row < kHeight; row += stripRows, ++idx) {
@@ -661,8 +1149,22 @@ bool presentStripFused(const present::Frame &frame)
 		}
 	}
 	if (inFlight) gea_render_parallel_wait();
-	g_drawBufferStale = (g_drawFramebuffer != g_framebuffer);
+	if (g_swapFbs) {
+		g_stale[back].count = 0;
+		g_publishPending = false;
+		commitSwap(back);
+		// The new back buffer lags by a whole frame; a later partial frame patches
+		// it in full once (a following full-frame present needs no patch at all).
+		for (int i = 0; i < g_scanFbCount; ++i) {
+			if (i == back) continue;
+			g_stale[i].count = 0;
+			staleAdd(g_stale[i], 0, 0, kWidth - 1, kHeight - 1);
+		}
+	} else {
+		g_drawBufferStale = (g_drawFramebuffer != g_framebuffer);
+	}
 	addFlushStats(esp_timer_get_time() - start, kWidth * kHeight);
+	noteFrameDiag(3, esp_timer_get_time() - start, kWidth * kHeight);
 	return true;
 }
 #endif
@@ -703,13 +1205,28 @@ bool submitRenderWorkerJob(void (*fn)(void *, int, int), void *ctx, int y0, int 
 		                                                   workerCore,
 		                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
-		const BaseType_t created = xTaskCreatePinnedToCore(renderRowWorkerTask,
+		BaseType_t created = xTaskCreatePinnedToCore(renderRowWorkerTask,
 		                                                   "gea_rowwrk",
 		                                                   kRenderRowWorkerStackBytes,
 		                                                   nullptr,
 		                                                   priority,
 		                                                   &g_renderRowWorker.task,
 		                                                   workerCore);
+#endif
+#if !GEA_EMBEDDED_RENDER_WORKER_STACK_EXTERNAL
+		if (created != pdPASS || !g_renderRowWorker.task) {
+			// Internal RAM is tight on an RGB board (bounce buffers, strip staging);
+			// the stack holds no DMA buffers, so PSRAM is a correct second choice.
+			g_renderRowWorker.task = nullptr;
+			created = xTaskCreatePinnedToCoreWithCaps(renderRowWorkerTask,
+			                                          "gea_rowwrk",
+			                                          kRenderRowWorkerStackBytes,
+			                                          nullptr,
+			                                          priority,
+			                                          &g_renderRowWorker.task,
+			                                          workerCore,
+			                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+		}
 #endif
 		if (created != pdPASS || !g_renderRowWorker.task) {
 			ESP_LOGW(kTag, "row worker create failed: create=%d stack=%u",
@@ -754,6 +1271,7 @@ extern "C" bool gea_render_parallel_submit(void (*fn)(void *, int, int), void *c
 	// band replay) route to the band canvas. Re-set each submit in case the frame
 	// task ever migrates cores.
 	g_renderCoreId = static_cast<int>(xPortGetCoreID());
+	ensureBackReady();  // the band draws into the back buffer
 	const bool ok = submitRenderWorkerJob(fn, ctx, y0, y1);
 	g_lastSubmitWasDrawBand = ok;
 	return ok;
@@ -1069,7 +1587,22 @@ bool Display::start()
 // Routed per-core: the worker core's band replay (and render.cpp helpers that
 // draw raw pixels through canvas()) must hit the band canvas — its own clip +
 // dirty accumulator over the same framebuffer. On the main core this is g_canvas.
-gea::framework::graphics::Canvas *Display::canvas() { return &replayCanvas(); }
+gea::framework::graphics::Canvas *Display::canvas()
+{
+#if GEA_EMBEDDED_DISPLAY_FUSE_REPLAY_FLUSH
+	// Fused builds: the engine asks for canvas() early each frame only to read
+	// its dirty box and scroll region, and draws inside the fused raster
+	// callbacks. Readying here would patch the whole stale area before
+	// flushRectsRasterized can say which rects it repaints (measured on the
+	// CrowPanel 7: 85k px / 12ms per frame, 13 fps vs 15.4). Still wait for the
+	// panel to let go of the buffer, so a raw draw through this pointer can never
+	// hit rows being scanned; one that lands before the patch is counted as late.
+	if (g_swapFbs && !g_backReady && !onWorkerCore()) waitBackBufferFree();
+	return &stateCanvas();
+#else
+	return &replayCanvas();
+#endif
+}
 
 // The render layer binds canvas() onto a scratch buffer (retained snapshots for
 // screenshots/OTA, fused rasterized flushes) and calls this to point it back at
@@ -1077,7 +1610,7 @@ gea::framework::graphics::Canvas *Display::canvas() { return &replayCanvas(); }
 // here: the union it held describes the scratch buffer, not the framebuffer.
 void Display::rebindCanvasToFramebuffer()
 {
-	replayCanvas().bindPixels(g_drawFramebuffer, kWidth, kHeight);
+	stateCanvas().bindPixels(g_drawFramebuffer, kWidth, kHeight);
 }
 
 // The RGB panel scans out of g_framebuffer continuously, so it holds exactly
@@ -1111,11 +1644,16 @@ int Display::countNonBlackPixels(bool)
 
 void Display::clear()
 {
+	ensureBackReady();
 	g_canvas.clear(0x0000);
 	flush();
 }
 
-void Display::clearNoFlush() { g_canvas.clear(0x0000); }
+void Display::clearNoFlush()
+{
+	ensureBackReady();
+	g_canvas.clear(0x0000);
+}
 void Display::print(const char *) {}
 
 void Display::flush()
@@ -1140,6 +1678,13 @@ void Display::flush()
 			cacheUs += esp_timer_get_time() - cacheStart;
 		}
 	g_canvas.resetDirty();
+	if (g_swapFbs) {
+		const int64_t swapStart = esp_timer_get_time();
+		publishSwap();
+		copyUs += esp_timer_get_time() - swapStart;
+		yieldToIdleIfStarved();
+	}
+	noteFrameDiag(0, esp_timer_get_time() - start, pixels);
 	addFlushStats(esp_timer_get_time() - start, pixels);
 	addFlushStageStats(copyUs, cacheUs);
 }
@@ -1166,12 +1711,40 @@ void Display::flushRects(const DisplayFlushRect *rects, int count, bool)
 				cacheUs += esp_timer_get_time() - cacheStart;
 			}
 		}
+		if (g_swapFbs) {
+			// The back buffer is the live draw target, so anything drawn outside the
+			// rects is about to be shown too: record it, or the front would never
+			// catch up and the pixels would flicker between frames.
+			int dx0, dy0, dx1, dy1;
+			if (g_canvas.dirty(&dx0, &dy0, &dx1, &dy1) && clipRect(&dx0, &dy0, &dx1, &dy1)) {
+				// The dirty tracker is one bounding box, so test it against the rects'
+				// bounding box: the renderer clips its drawing to the rects themselves.
+				int bx0 = rects[0].x0, by0 = rects[0].y0, bx1 = rects[0].x1, by1 = rects[0].y1;
+				for (int i = 1; i < count; ++i) {
+					bx0 = std::min(bx0, rects[i].x0);
+					by0 = std::min(by0, rects[i].y0);
+					bx1 = std::max(bx1, rects[i].x1);
+					by1 = std::max(by1, rects[i].y1);
+				}
+				if (dx0 < bx0 || dy0 < by0 || dx1 > bx1 || dy1 > by1) markStale(dx0, dy0, dx1, dy1);
+			}
+		}
 		g_canvas.resetDirty();
+	if (g_swapFbs) {
+		const int64_t swapStart = esp_timer_get_time();
+		publishSwap();
+		copyUs += esp_timer_get_time() - swapStart;
+		yieldToIdleIfStarved();
+	}
+	noteFrameDiag(1, esp_timer_get_time() - start, pixels);
 	addFlushStats(esp_timer_get_time() - start, pixels);
 	addFlushStageStats(copyUs, cacheUs);
 }
 
-bool Display::streamRect(int x, int y, int w, int h, DisplayStreamRasterFn raster, void *user)
+}  // namespace gea::platform::display
+
+namespace {
+bool streamRectNoSwap(int x, int y, int w, int h, gea::platform::display::DisplayStreamRasterFn raster, void *user)
 {
 	if (!g_framebuffer || !g_drawFramebuffer || !raster || w <= 0 || h <= 0) return false;
 	int x0 = x;
@@ -1186,19 +1759,40 @@ bool Display::streamRect(int x, int y, int w, int h, DisplayStreamRasterFn raste
 
 	const int width = x1 - x0 + 1;
 	const int height = y1 - y0 + 1;
-	const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * sizeof(std::uint16_t);
-	auto *scratch = static_cast<std::uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-	if (!scratch) scratch = static_cast<std::uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
-	if (!scratch) return false;
-
+	ensureBackReady();  // no-op when flushRectsRasterized already readied it
 	const int64_t start = esp_timer_get_time();
-	raster(scratch, width, height, x0, y0, user);
-	for (int row = 0; row < height; ++row) {
-		std::copy_n(&scratch[static_cast<std::size_t>(row) * width],
-		            width,
-		            &g_drawFramebuffer[static_cast<std::size_t>(y0 + row) * kWidth + x0]);
+	if (g_stripBuffer) {
+		// Raster the region band by band into internal RAM (fast, off the PSRAM
+		// bus, blends never read PSRAM) and write each finished band out once. The
+		// raster contract is per-chunk -- the QSPI backend calls it per DMA chunk.
+		const int bandRows = std::max(1, static_cast<int>(kStripBufferPixels / static_cast<std::size_t>(width)));
+		for (int row = 0; row < height; row += bandRows) {
+			const int rows = std::min(bandRows, height - row);
+			const std::int64_t r0 = esp_timer_get_time();
+			raster(g_stripBuffer, width, rows, x0, y0 + row, user);
+			const std::int64_t r1 = esp_timer_get_time();
+			for (int i = 0; i < rows; ++i) {
+				std::memcpy(&g_drawFramebuffer[static_cast<std::size_t>(y0 + row + i) * kWidth + x0],
+				            &g_stripBuffer[static_cast<std::size_t>(i) * width],
+				            static_cast<std::size_t>(width) * sizeof(std::uint16_t));
+			}
+			g_swapDiag.rasterUs += r1 - r0;
+			g_swapDiag.copyUs += esp_timer_get_time() - r1;
+		}
+	} else {
+		const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * sizeof(std::uint16_t);
+		auto *scratch = static_cast<std::uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+		if (!scratch) scratch = static_cast<std::uint16_t *>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+		if (!scratch) return false;
+		raster(scratch, width, height, x0, y0, user);
+		g_swapDiag.rasterUs += esp_timer_get_time() - start;
+		for (int row = 0; row < height; ++row) {
+			std::copy_n(&scratch[static_cast<std::size_t>(row) * width],
+			            width,
+			            &g_drawFramebuffer[static_cast<std::size_t>(y0 + row) * kWidth + x0]);
+		}
+		heap_caps_free(scratch);
 	}
-	heap_caps_free(scratch);
 		int publishedX0 = 0;
 		int publishedY0 = 0;
 		int publishedX1 = -1;
@@ -1209,17 +1803,39 @@ bool Display::streamRect(int x, int y, int w, int h, DisplayStreamRasterFn raste
 		addFlushStats(esp_timer_get_time() - start, pixels);
 	return true;
 }
+}  // namespace
 
-// The fused path exists so a QSPI panel can overlap rasterization with the
-// DMA that carries each chunk. An RGB panel's scanout is continuous and the
-// framebuffer is already in place, so each rect is rastered into a scratch
-// block and published like any other region -- same pixels, no chunking.
+namespace gea::platform::display {
+
+bool Display::streamRect(int x, int y, int w, int h, DisplayStreamRasterFn raster, void *user)
+{
+	if (raster && w > 0 && h > 0) {
+		const DisplayFlushRect rect = {x, y, x + w - 1, y + h - 1};
+		ensureBackReady(&rect, 1);
+	}
+	const bool ok = streamRectNoSwap(x, y, w, h, raster, user);
+	if (g_swapFbs) publishSwap();
+	return ok;
+}
+
+// Fused flush: each rect is rastered from the display list into internal-RAM
+// bands and written to the back buffer once. Because these rects are repainted
+// completely, readying the back buffer patches only the stale area outside them.
 void Display::flushRectsRasterized(const DisplayFlushRect *rects, int count, DisplayStreamRasterFn raster, void *user, bool)
 {
 	if (!rects || count <= 0 || !raster) return;
+	const std::int64_t start = esp_timer_get_time();
+	ensureBackReady(rects, count);
+	int px = 0;
 	for (int i = 0; i < count; ++i) {
-		streamRect(rects[i].x0, rects[i].y0, rects[i].x1 - rects[i].x0 + 1, rects[i].y1 - rects[i].y0 + 1, raster, user);
+		streamRectNoSwap(rects[i].x0, rects[i].y0, rects[i].x1 - rects[i].x0 + 1, rects[i].y1 - rects[i].y0 + 1, raster, user);
+		px += (rects[i].x1 - rects[i].x0 + 1) * (rects[i].y1 - rects[i].y0 + 1);
 	}
+	if (g_swapFbs) {
+		publishSwap();
+		yieldToIdleIfStarved();
+	}
+	noteFrameDiag(2, esp_timer_get_time() - start, px);
 	rebindCanvasToFramebuffer();
 }
 
@@ -1241,6 +1857,7 @@ bool Display::present(const DisplayPresentCommand *commands, int commandCount)
 	// Fallback: per-command replay into the PSRAM back buffer, then publish. If
 	// the last frame went through the strip path, the back buffer is stale —
 	// re-seed it from the live scanout before drawing the partial update on top.
+	ensureBackReady();
 	if (g_drawBufferStale && g_drawFramebuffer != g_framebuffer) {
 		std::memcpy(g_drawFramebuffer, g_framebuffer, kFramebufferBytes);
 		g_drawBufferStale = false;
@@ -1300,11 +1917,11 @@ int Display::flushBufferBytes() { return 0; }
 // 2nd-core band replay lands on the worker canvas (its own clip + dirty over
 // the same framebuffer). On the main core replayCanvas() == g_canvas, so the
 // single-core paths are unchanged.
-void Display::pushClip(int x, int y, int w, int h) { replayCanvas().pushClip(x, y, w, h); }
-void Display::popClip() { replayCanvas().popClip(); }
-void Display::resetClip() { replayCanvas().resetClip(); }
-void Display::setAlpha(std::uint8_t alpha) { replayCanvas().setGlobalAlpha(alpha); }
-std::uint8_t Display::alpha() { return replayCanvas().globalAlpha(); }
+void Display::pushClip(int x, int y, int w, int h) { stateCanvas().pushClip(x, y, w, h); }
+void Display::popClip() { stateCanvas().popClip(); }
+void Display::resetClip() { stateCanvas().resetClip(); }
+void Display::setAlpha(std::uint8_t alpha) { stateCanvas().setGlobalAlpha(alpha); }
+std::uint8_t Display::alpha() { return stateCanvas().globalAlpha(); }
 int Display::brightness() { return g_brightness; }
 
 void Display::setBrightness(int brightnessPercent)
@@ -1321,7 +1938,7 @@ void Display::invalidate() {}
 bool Display::vsyncEnabled() { return false; }
 void Display::vsyncWaitForFrame() {}
 
-void Display::clip(int *x0, int *y0, int *x1, int *y1) { replayCanvas().currentClip(x0, y0, x1, y1); }
+void Display::clip(int *x0, int *y0, int *x1, int *y1) { stateCanvas().currentClip(x0, y0, x1, y1); }
 void Display::fillRect(int x, int y, int w, int h, std::uint16_t color) { replayCanvas().fillRect(x, y, w, h, color); }
 void Display::scrollRect(int x, int y, int w, int h, int dx, int dy) { replayCanvas().scrollRect(x, y, w, h, dx, dy); }
 void Display::resetScrollRegion() { replayCanvas().setScrollRegion(0, 0, 0); }

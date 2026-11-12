@@ -732,6 +732,26 @@
       "inference": {
         "canvasOnly": true
       }
+    },
+    "esp32-s3-elecrow-crowpanel-advance-7.0": {
+      "supported": [
+        "compiler.generatedCodeOptimization",
+        "services.wifi",
+        "renderer.fuseReplayFlush"
+      ],
+      "defaults": {
+        "compiler": {
+          "generatedCodeOptimization": "O2",
+          "numberPrecision": "float32"
+        },
+        "services": {
+          "wifi": "auto"
+        },
+        "renderer": {
+          "fuseReplayFlush": false
+        }
+      },
+      "cssDevicePixelRatio": 1.5
     }
   }
 }
