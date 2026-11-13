@@ -43,7 +43,7 @@
     "expander": {
       "driver": "ch422g",
       "interface": "i2c",
-      "_outputs": "EXIO1 touch reset, EXIO2 backlight (DISP), EXIO3 panel reset, EXIO4 microSD chip-select. On the B, EXIO0 and EXIO5 are the isolated digital inputs DI0/DI1 and OD0/OD1 the isolated outputs, none of which a composed board drives. initialOutputs 0x1e as on the 7-inch: resets released, backlight on, card deselected.",
+      "_outputs": "EXIO1 touch reset, EXIO2 backlight (DISP), EXIO3 panel reset, EXIO4 microSD chip-select. initialOutputs 0x1e as on the 7-inch: resets released, backlight on, card deselected. The CH422G has one output-enable bit for IO0-IO7, so every IO line becomes an output and 0x1e drives EXIO0 and EXIO5 low; on the B those are the isolated digital inputs DI0/DI1, which cannot be read while a composed board runs. The isolated outputs OD0/OD1 have no role here.",
       "initialOutputs": 30,
       "outputs": { "touchReset": 1, "backlight": 2, "displayReset": 3 }
     }

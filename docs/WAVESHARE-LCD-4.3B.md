@@ -23,8 +23,11 @@ so there is no second console on a header.
   0x5d; reset is EXIO1 on the expander.
 - CH422G: EXIO1 touch reset, EXIO2 backlight (DISP), EXIO3 panel reset, EXIO4 microSD
   chip-select. `initialOutputs` 0x1e as on the 7-inch: resets released, backlight on,
-  card deselected. EXIO0 and EXIO5 are the isolated inputs DI0/DI1 and OD0/OD1 the
-  isolated outputs; a composed board leaves them alone.
+  card deselected. The CH422G has a single output-enable bit for IO0–IO7, so enabling the
+  control outputs makes every IO line an output: 0x1e drives EXIO0 and EXIO5, the
+  isolated inputs DI0/DI1, low, and they cannot be read while a composed board runs. The
+  base also writes the open-drain lines their default level (0x0f); the definition gives
+  the isolated outputs OD0/OD1 no role.
 - GPIO0 carries G3, so the BOOT button is not a launcher button.
 - The microSD slot is on SPI (MOSI11, SCK12, MISO13, CS on EXIO4), which the composed
   base does not drive; no storage is declared.
